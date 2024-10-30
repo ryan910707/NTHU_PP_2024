@@ -11,7 +11,7 @@
 #include <sched.h>
 
 int num_threads;
-int64_t* image;
+int* image;
 int width;
 int height;
 int iters;
@@ -25,7 +25,7 @@ int chunk_size; // Parameter for column chunk size
 // Constants for SIMD operations
 __m512d v_2;
 __m512d v_4;
-__m512i v_1;
+__m256i v_1;
 
 // Synchronization variables
 int* row_ready;
@@ -75,10 +75,10 @@ void task_queue_push(task_queue_t* queue, task_t task) {
     pthread_mutex_unlock(&queue->mutex);
 }
 
-void task_queue_destroy(task_queue_t* queue) {
-    pthread_mutex_destroy(&queue->mutex);
-    pthread_cond_destroy(&queue->cond);
-}
+// void task_queue_destroy(task_queue_t* queue) {
+//     pthread_mutex_destroy(&queue->mutex);
+//     pthread_cond_destroy(&queue->cond);
+// }
 
 int task_queue_pop(task_queue_t* queue, task_t* task) {
     pthread_mutex_lock(&queue->mutex);
@@ -91,11 +91,11 @@ int task_queue_pop(task_queue_t* queue, task_t* task) {
     if (queue->front == NULL) {
         queue->rear = NULL;
     }
-    free(node);
     pthread_mutex_unlock(&queue->mutex);
     return 1;
 }
 
+__mmask8 mask = 0xFF;
 void* worker_function(void* arg) {
     task_queue_t* queue = (task_queue_t*)arg;
     task_t task;
@@ -108,6 +108,7 @@ void* worker_function(void* arg) {
         int row = task.row;
         int col_start = task.col_start;
         int col_end = task.col_end;
+        int offset = row*width;
 
         double y0 = row * y_scale + lower;
         __m512d v_y0 = _mm512_set1_pd(y0);
@@ -121,38 +122,45 @@ void* worker_function(void* arg) {
                 __m512d v_x = _mm512_setzero_pd();
                 __m512d v_y = _mm512_setzero_pd();
                 __m512d v_length_squared = _mm512_setzero_pd();
-                __m512i v_repeat = _mm512_setzero_si512();
-
+                __m256i v_repeat = _mm256_setzero_si256();
+                __m512d v_x_sq = _mm512_setzero_pd();
+                __m512d v_y_sq = _mm512_setzero_pd();
                 for(int k=0;k<iters;k++) {
                     __mmask8 cmp_mask = _mm512_cmp_pd_mask(v_length_squared, v_4, _CMP_LT_OS);
                     if (cmp_mask == 0)
                         break;
 
-                    v_repeat = _mm512_mask_add_epi64(v_repeat, cmp_mask, v_repeat, v_1);
+                    v_repeat = _mm256_mask_add_epi32(v_repeat, cmp_mask, v_repeat, v_1);
 
-                    __m512d v_x_sq = _mm512_mul_pd(v_x, v_x);
-                    __m512d v_y_sq = _mm512_mul_pd(v_y, v_y);
                     __m512d temp = _mm512_add_pd(_mm512_sub_pd(v_x_sq, v_y_sq), v_x0);
                     v_y = _mm512_fmadd_pd(_mm512_mul_pd(v_x, v_y), v_2, v_y0);
                     v_x = temp;
-                    v_length_squared = _mm512_fmadd_pd(v_x, v_x, _mm512_mul_pd(v_y, v_y));
+                    v_x_sq = _mm512_mul_pd(v_x, v_x);
+                    v_y_sq = _mm512_mul_pd(v_y, v_y);
+                    v_length_squared = _mm512_fmadd_pd(v_x, v_x, v_y_sq);
                 }
-                _mm512_storeu_si512((__m512i*)(image + row * width + i), v_repeat);
+                _mm256_mask_storeu_epi32((__m256i*)(image + offset + i), mask, v_repeat);
             } else {
                 for (int k = i; k < col_end; ++k) {
                     double x0 = k * x_scale + left;
-                    int repeats = 0;
                     double x = 0;
                     double y = 0;
+                    double x_2 = 0;
+                    double y_2 = 0;
                     double length_squared = 0;
-                    while (repeats < iters && length_squared < 4) {
-                        double temp = x * x - y * y + x0;
+                    int repeats = 0;
+                    for(int k =0;k<iters;k++) {
+                        if(length_squared>4)
+                            break;
+                        double temp = x_2 - y_2 + x0;
                         y = 2 * x * y + y0;
                         x = temp;
-                        length_squared = x * x + y * y;
-                        ++repeats;
+                        x_2 = x*x;
+                        y_2 = y*y;
+                        length_squared = x_2 + y_2;
+                        repeats++;
                     }
-                    image[row * width + k] = repeats;
+                    image[offset + k] = repeats;
                 }
             }
         }
@@ -166,7 +174,7 @@ void* worker_function(void* arg) {
         }
         pthread_mutex_unlock(&row_mutexes[row]);
     }
-    pthread_exit(NULL);
+    // pthread_exit(NULL);
 }
 
 int main(int argc, char** argv) {
@@ -186,12 +194,12 @@ int main(int argc, char** argv) {
     chunk_size = 2000;
 
     /* allocate memory for image */
-    image = (int64_t*)malloc(width * height * sizeof(int64_t));
+    image = (int*)malloc(width * height * sizeof(int));
 
     /* Initialize constants for SIMD */
     v_2 = _mm512_set1_pd(2.0);
     v_4 = _mm512_set1_pd(4.0);
-    v_1 = _mm512_set1_epi64(1);
+    v_1 = _mm256_set1_epi32(1);
 
     y_scale = ((upper - lower) / height);
     x_scale = ((right - left) / width);
@@ -263,7 +271,7 @@ int main(int argc, char** argv) {
 
         memset(row, 0, row_size);
         for (int x = 0; x < width; ++x) {
-            int64_t p = image[y * width + x];
+            int p = image[y * width + x];
             png_bytep color = row + x * 3;
             if (p != iters) {
                 int p_shift = (p & 0xF)<<4;
