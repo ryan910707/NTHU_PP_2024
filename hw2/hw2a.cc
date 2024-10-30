@@ -191,7 +191,7 @@ int main(int argc, char** argv) {
     upper = strtod(argv[6], 0);
     width = strtol(argv[7], 0, 10);
     height = strtol(argv[8], 0, 10);
-    chunk_size = 2000;
+    chunk_size = width;
 
     /* allocate memory for image */
     image = (int*)malloc(width * height * sizeof(int));
@@ -248,7 +248,7 @@ int main(int argc, char** argv) {
                  PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
     png_set_filter(png_ptr, 0, PNG_FILTER_NONE);
     png_write_info(png_ptr, info_ptr);
-    png_set_compression_level(png_ptr, 1);
+    png_set_compression_level(png_ptr, 0);
 
     size_t row_size = 3 * width * sizeof(png_byte);
     png_bytep row = (png_bytep)malloc(row_size);
@@ -286,28 +286,6 @@ int main(int argc, char** argv) {
         png_write_row(png_ptr, row);
     }
 
-    /* Wait for all threads to finish */
-    // for (int i = 0; i < num_threads; i++) {
-    //     pthread_join(threads[i], NULL);
-    // }
-
-    /* Destroy task queue */
-    // task_queue_destroy(&task_queue);
-
-    /* Clean up */
     png_write_end(png_ptr, NULL);
-    // png_destroy_write_struct(&png_ptr, &info_ptr);
-    // fclose(fp);
-    // free(row);
-    // free(image);
-    // free(row_ready);
-    // free(row_chunk_counts);
-
-    // for (int i = 0; i < height; i++) {
-    //     pthread_mutex_destroy(&row_mutexes[i]);
-    //     pthread_cond_destroy(&row_conds[i]);
-    // }
-    // free(row_mutexes);
-    // free(row_conds);
 
 }
