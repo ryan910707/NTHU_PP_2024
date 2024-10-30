@@ -20,13 +20,18 @@ double right;
 double lower;
 double upper;
 double y_scale, x_scale;
-int chunk_size; // New parameter for column chunk size
+int chunk_size; // Parameter for column chunk size
 
 // Constants for SIMD operations
 __m512d v_2;
 __m512d v_4;
 __m512i v_1;
-const __m512d v_increment = _mm512_set1_pd(8.0);
+
+// Synchronization variables
+int* row_ready;
+int* row_chunk_counts;
+pthread_mutex_t* row_mutexes;
+pthread_cond_t* row_conds;
 
 // Task structure
 typedef struct {
@@ -151,6 +156,15 @@ void* worker_function(void* arg) {
                 }
             }
         }
+
+        // Decrement the row chunk count
+        pthread_mutex_lock(&row_mutexes[row]);
+        row_chunk_counts[row]--;
+        if (row_chunk_counts[row] == 0) {
+            // All chunks for this row are done
+            pthread_cond_signal(&row_conds[row]);
+        }
+        pthread_mutex_unlock(&row_mutexes[row]);
     }
     pthread_exit(NULL);
 }
@@ -169,7 +183,7 @@ int main(int argc, char** argv) {
     upper = strtod(argv[6], 0);
     width = strtol(argv[7], 0, 10);
     height = strtol(argv[8], 0, 10);
-    chunk_size = 1800;
+    chunk_size = 2000;
 
     /* allocate memory for image */
     image = (int64_t*)malloc(width * height * sizeof(int64_t));
@@ -186,6 +200,20 @@ int main(int argc, char** argv) {
     task_queue_t task_queue;
     task_queue_init(&task_queue);
 
+    /* Initialize synchronization variables */
+    row_ready = (int*)malloc(height*sizeof(int));
+    row_chunk_counts = (int*)malloc(height * sizeof(int));
+    row_mutexes = (pthread_mutex_t*)malloc(height * sizeof(pthread_mutex_t));
+    row_conds = (pthread_cond_t*)malloc(height * sizeof(pthread_cond_t));
+
+    /* Calculate number of chunks per row */
+    int chunks_per_row = (width + chunk_size - 1) / chunk_size;
+    for (int i = 0; i < height; i++) {
+        row_chunk_counts[i] = chunks_per_row;
+        pthread_mutex_init(&row_mutexes[i], NULL);
+        pthread_cond_init(&row_conds[i], NULL);
+    }
+
     /* Create worker threads */
     pthread_t threads[num_threads];
     for (int i = 0; i < num_threads; i++) {
@@ -193,9 +221,8 @@ int main(int argc, char** argv) {
     }
 
     /* Fill task queue with tasks (chunks of columns per row) */
-    
-    for (int col = 0; col < width; col += chunk_size) {
-        for (int row = 0; row < height; row++) {
+    for (int row = height-1; row >=0; row--) {
+        for (int col = 0; col < width; col += chunk_size) {
             task_t task;
             task.row = row;
             task.col_start = col;
@@ -204,14 +231,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* Push exit tasks for each worker */
-    for (int i = 0; i < num_threads; i++) {
-        task_t exit_task;
-        exit_task.row = -1;
-        exit_task.col_start = 0;
-        exit_task.col_end = 0;
-        task_queue_push(&task_queue, exit_task);
-    }
+    /* Initialize PNG writing */
     FILE* fp = fopen(filename, "wb");
     png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
     png_infop info_ptr = png_create_info_struct(png_ptr);
@@ -222,21 +242,28 @@ int main(int argc, char** argv) {
     png_write_info(png_ptr, info_ptr);
     png_set_compression_level(png_ptr, 1);
 
-    /* Wait for all threads to finish */
-    for (int i = 0; i < num_threads; i++) {
-        pthread_join(threads[i], NULL);
-    }
-
-    /* Destroy task queue */
-    // task_queue_destroy(&task_queue);
-
-    /* Write the image to a PNG file */
     size_t row_size = 3 * width * sizeof(png_byte);
     png_bytep row = (png_bytep)malloc(row_size);
-    for (int y = 0; y < height; ++y) {
+
+
+    /* Push exit tasks for each worker */
+    for (int i = 0; i < num_threads; i++) {
+        task_t exit_task;
+        exit_task.row = -1;
+        exit_task.col_start = 0;
+        exit_task.col_end = 0;
+        task_queue_push(&task_queue, exit_task);
+    }
+    for (int y = height-1; y >=0; y--) {
+        pthread_mutex_lock(&row_mutexes[y]);
+        while (row_chunk_counts[y] != 0) {
+            pthread_cond_wait(&row_conds[y], &row_mutexes[y]);
+        }
+        pthread_mutex_unlock(&row_mutexes[y]);
+
         memset(row, 0, row_size);
         for (int x = 0; x < width; ++x) {
-            int64_t p = image[(height - 1 - y) * width + x];
+            int64_t p = image[y * width + x];
             png_bytep color = row + x * 3;
             if (p != iters) {
                 int p_shift = (p & 0xF)<<4;
@@ -251,6 +278,28 @@ int main(int argc, char** argv) {
         png_write_row(png_ptr, row);
     }
 
+    /* Wait for all threads to finish */
+    // for (int i = 0; i < num_threads; i++) {
+    //     pthread_join(threads[i], NULL);
+    // }
+
+    /* Destroy task queue */
+    // task_queue_destroy(&task_queue);
+
+    /* Clean up */
     png_write_end(png_ptr, NULL);
-    return 0;
+    // png_destroy_write_struct(&png_ptr, &info_ptr);
+    // fclose(fp);
+    // free(row);
+    // free(image);
+    // free(row_ready);
+    // free(row_chunk_counts);
+
+    // for (int i = 0; i < height; i++) {
+    //     pthread_mutex_destroy(&row_mutexes[i]);
+    //     pthread_cond_destroy(&row_conds[i]);
+    // }
+    // free(row_mutexes);
+    // free(row_conds);
+
 }
