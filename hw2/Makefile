@@ -1,7 +1,7 @@
 CC = gcc
 CXX = g++
 LDLIBS = -lpng
-CFLAGS = -lm -O1 -march=native -ftree-vectorize
+CFLAGS = -lm -O3 -march=native -ftree-vectorize
 hw2a: CFLAGS += -pthread
 hw2b: CC = mpicc
 hw2b: CXX = mpicxx
