@@ -9,6 +9,7 @@
 #include <immintrin.h>
 #include <stdlib.h>
 #include <sched.h>
+#include <nvtx3/nvToolsExt.h>
 
 int num_threads;
 int* image;
@@ -21,6 +22,7 @@ double lower;
 double upper;
 double y_scale, x_scale;
 int chunk_size; // Parameter for column chunk size
+
 
 // Constants for SIMD operations
 __m512d v_2;
@@ -100,11 +102,12 @@ void* worker_function(void* arg) {
     task_queue_t* queue = (task_queue_t*)arg;
     task_t task;
     while (1) {
+        task_queue_pop(queue, &task);
         if (task.row == -1) {
             // Exit task received
             break;
         }
-        task_queue_pop(queue, &task);
+        nvtxRangePush("worker_function");
         int row = task.row;
         int col_start = task.col_start;
         int col_end = task.col_end;
@@ -173,11 +176,14 @@ void* worker_function(void* arg) {
             pthread_cond_signal(&row_conds[row]);
         }
         pthread_mutex_unlock(&row_mutexes[row]);
+        nvtxRangePop();
     }
-    // pthread_exit(NULL);
+    pthread_exit(NULL);
 }
 
+
 int main(int argc, char** argv) {
+    nvtxRangePush("main");
     /* detect how many CPUs are available */
     cpu_set_t cpu_set;
     sched_getaffinity(0, sizeof(cpu_set), &cpu_set);
@@ -246,9 +252,9 @@ int main(int argc, char** argv) {
     png_init_io(png_ptr, fp);
     png_set_IHDR(png_ptr, info_ptr, width, height, 8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
                  PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
-    png_set_filter(png_ptr, 0, PNG_FILTER_NONE);
+    png_set_filter(png_ptr, 0, PNG_NO_FILTERS);
     png_write_info(png_ptr, info_ptr);
-    png_set_compression_level(png_ptr, 0);
+    png_set_compression_level(png_ptr, 1);
 
     size_t row_size = 3 * width * sizeof(png_byte);
     png_bytep row = (png_bytep)malloc(row_size);
@@ -262,12 +268,9 @@ int main(int argc, char** argv) {
         exit_task.col_end = 0;
         task_queue_push(&task_queue, exit_task);
     }
+    nvtxRangePush("write_png");
     for (int y = height-1; y >=0; y--) {
-        pthread_mutex_lock(&row_mutexes[y]);
-        while (row_chunk_counts[y] != 0) {
-            pthread_cond_wait(&row_conds[y], &row_mutexes[y]);
-        }
-        pthread_mutex_unlock(&row_mutexes[y]);
+
 
         memset(row, 0, row_size);
         for (int x = 0; x < width; ++x) {
@@ -285,7 +288,7 @@ int main(int argc, char** argv) {
         }
         png_write_row(png_ptr, row);
     }
-
     png_write_end(png_ptr, NULL);
-
+    nvtxRangePop();
+    nvtxRangePop();
 }
