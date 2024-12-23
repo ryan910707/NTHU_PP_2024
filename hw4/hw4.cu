@@ -15,7 +15,7 @@ int B, N, d;
 float *Q, *K, *V, *O;
 #define br 32
 #define bc 32
-#define d_offset 64
+#define d_offset 65
 
 void input(char *input_filename) {
     FILE *file = fopen(input_filename, "rb");
@@ -52,97 +52,28 @@ void output(char *output_filename) {
     fclose(file);
 }
 
-__device__ void QKDotAndScalar(float *out, float *q, float *k, float scalar, int d) {
-    
-    int row = threadIdx.y;
-    int col = threadIdx.x;
-    float val = 0.0f;
-    for (int t = 0; t < d; t++) {
-        val += q[row * d_offset + t] * k[col * d_offset + t];
-    }
-    out[row * bc + col] = val * scalar;
-}
-
-__device__ void RowMax(float *out, float *in) {
-    int row = threadIdx.y;
-    // Only one thread per row computes the maximum
-    if (threadIdx.x == 0) {
-        float max_val = in[row * bc];
-        for (int i = 0; i < bc; i++) {
-            max_val = _max(max_val, in[row * bc + i]);
-        }
-        out[row] = max_val;
-    }
-}
-
-__device__ void MinusMaxAndExp(float *out, float *in, float *mx) {
-    int row = threadIdx.y;
-    int col = threadIdx.x;
-    out[row * bc + col] = expf(in[row * bc + col] - mx[row]);
-}
-
-__device__ void RowSum(float *out, float *in) {
-    int row = threadIdx.y;
-    // Only one thread per row computes the sum
-    if (threadIdx.x == 0) {
-        float sum_val = 0.0f;
-        for (int i = 0; i < bc; i++) {
-            sum_val += in[row * bc + i];
-        }
-        out[row] = sum_val;
-    }
-}
-
-__device__ void UpdateMiLiOi(float *mi, float *li, float *oi, float *mij, float *lij, float *pij, float *vj, int d) {
-    __shared__ float mi_new[br];
-    __shared__ float li_new[br];
-    int i = threadIdx.y;
-    int j = threadIdx.x;
-
-    if(threadIdx.x == 0){ 
-        mi_new[i] = _max(mi[i], mij[i]);
-        li_new[i] = expf(mi[i] - mi_new[i]) * li[i] + expf(mij[i] - mi_new[i]) * lij[i];
-    }
-    __syncthreads();
-
-    for(int round =0; round <d/bc; round++){
-        float pv = 0.0F;
-        for (int t = 0; t < bc; t++) {
-            pv += pij[i * bc + t] * vj[t * d_offset + j+round*bc];
-        }
-        oi[i * d_offset + j+round*bc] = (li[i] * expf(mi[i] - mi_new[i]) * oi[i * d_offset + j+round*bc] + expf(mij[i] - mi_new[i]) * pv) / li_new[i];
-    }
-    __syncthreads();
-
-    if(threadIdx.x == 0){
-        mi[i] = mi_new[i];
-        li[i] = li_new[i];
-    }   
-}
-
 __global__ void flash_attention(float *q, float *k, float *v, float *o, float* l, float* m, int d, int tc, int N){
     for (int j = 0; j < tc; j++){
-        //load k and v to shared memory
+        // Load k and v to shared memory
         __shared__ float kj[bc*d_offset];
         __shared__ float vj[bc*d_offset];
-        int round = d/bc;
+        int round = d / bc;
         for(int i=0;i<round;i++){
             kj[threadIdx.y*d_offset+threadIdx.x+i*bc] = k[j*bc*d+threadIdx.y*d+threadIdx.x+i*bc];
             vj[threadIdx.y*d_offset+threadIdx.x+i*bc] = v[j*bc*d+threadIdx.y*d+threadIdx.x+i*bc];
         }
-        __syncthreads();
 
-
-        //load shared memory
-        __shared__ float sij[br*bc];
-        __shared__ float pij[br*bc];
+        // Shared memory allocations
+        __shared__ float sij[br*bc];   // S = QK^T * scalar
+        __shared__ float pij[br*bc];   // P = softmax(S)
         __shared__ float qi[br*d_offset];
         __shared__ float oi[br*d_offset];
         __shared__ float li[br];
         __shared__ float mi[br];
         __shared__ float mij[br];
         __shared__ float lij[br];
-        
+
+        // Load Q and O from global memory
         for(int round=0; round<d/bc; round++){
             qi[threadIdx.y*d_offset+threadIdx.x+round*bc] = q[blockIdx.x*br*d+threadIdx.y*d+threadIdx.x+round*bc];
             oi[threadIdx.y*d_offset+threadIdx.x+round*bc] = o[blockIdx.x*br*d+threadIdx.y*d+threadIdx.x+round*bc];
@@ -154,19 +85,85 @@ __global__ void flash_attention(float *q, float *k, float *v, float *o, float* l
         }
         __syncthreads();
 
+        // Inline QKDotAndScalar
+        {
+            int row = threadIdx.y;
+            int col = threadIdx.x;
+            float val = 0.0f;
+            for (int t = 0; t < d; t++) {
+                val += qi[row * d_offset + t] * kj[col * d_offset + t];
+            }
+            sij[row * bc + col] = val * (1.0f / sqrtf((float)d));
+        }
+        __syncthreads();
 
-        QKDotAndScalar(sij, qi, kj, 1.0 / sqrtf((float)d), d);
-        __syncthreads();
-        RowMax(mij, sij);
-        __syncthreads();
-        MinusMaxAndExp(pij, sij, mij);
-        __syncthreads();
-        RowSum(lij, pij);
+        // Inline RowMax
+        {
+            int row = threadIdx.y;
+            if (threadIdx.x == 0) {
+                float max_val = sij[row * bc];
+                for (int i = 0; i < bc; i++) {
+                    max_val = _max(max_val, sij[row * bc + i]);
+                }
+                mij[row] = max_val;
+            }
+        }
         __syncthreads();
 
-        UpdateMiLiOi(mi, li, oi, mij, lij, pij, vj, d);
+        // Inline MinusMaxAndExp
+        {
+            int row = threadIdx.y;
+            int col = threadIdx.x;
+            pij[row * bc + col] = expf(sij[row * bc + col] - mij[row]);
+        }
+        __syncthreads();
 
-        //write back
+        // Inline RowSum
+        {
+            int row = threadIdx.y;
+            if (threadIdx.x == 0) {
+                float sum_val = 0.0f;
+                for (int i = 0; i < bc; i++) {
+                    sum_val += pij[row * bc + i];
+                }
+                lij[row] = sum_val;
+            }
+        }
+        __syncthreads();
+
+        // Inline UpdateMiLiOi
+        {
+            __shared__ float li_new[br];
+            int i = threadIdx.y;
+            int jx = threadIdx.x;
+
+            // Compute mi_new, li_new
+            if(jx == 0){ 
+                li_new[i] = expf(mi[i] - 0) * li[i] + expf(mij[i] - 0) * lij[i];
+            }
+            // __syncthreads();
+
+            // Update Oi
+            for(int r =0; r < d/bc; r++){
+                float pv = 0.0F;
+                for (int t = 0; t < bc; t++) {
+                    pv += pij[i * bc + t] * vj[t * d_offset + jx+r*bc];
+                }
+                // Weighted combination for oi
+                oi[i * d_offset + jx+r*bc] = (li[i] * expf(mi[i] - 0) * oi[i * d_offset + jx+r*bc] 
+                                             + expf(mij[i] - 0) * pv) / li_new[i];
+            }
+            // __syncthreads();
+
+            // Update mi, li
+            if(jx == 0){
+                mi[i] = 0;
+                li[i] = li_new[i];
+            }
+        }
+        // __syncthreads();
+
+        // Write back O, l, m
         for(int round=0; round<d/bc; round++){
             o[blockIdx.x*br*d+threadIdx.y*d+threadIdx.x+round*bc] = oi[threadIdx.y*d_offset+threadIdx.x+round*bc];
         }
@@ -174,7 +171,6 @@ __global__ void flash_attention(float *q, float *k, float *v, float *o, float* l
             l[blockIdx.x*br+threadIdx.y] = li[threadIdx.y];
             m[blockIdx.x*br+threadIdx.y] = mi[threadIdx.y];
         }
-        
     }
 }
 
