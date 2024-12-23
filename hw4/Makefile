@@ -2,7 +2,7 @@ CC = gcc
 NVCC = nvcc
 
 CFLAGS = -Wall -g
-NVFLAGS = -std=c++11 -O3 -Xptxas="-v" -arch=sm_61
+NVFLAGS = -std=c++11 -O3 -Xptxas="-v" -arch=sm_61 -use_fast_math
 LDFLAGS = -lm
 
 TARGETS = seq-attention seq-flashattention hw4

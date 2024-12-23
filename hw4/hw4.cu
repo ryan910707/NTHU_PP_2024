@@ -5,21 +5,24 @@
 #include <float.h>
 #include <sys/time.h>
 
-void input(char *input_filename);
-void output(char *output_filename);
-
 __device__ float _max(float a, float b) { return a > b ? a : b; }
 __device__ float _min(float a, float b) { return a < b ? a : b; }
 
+// Global variables as before
 int B, N, d;
 float *Q, *K, *V, *O;
+
+// Adjust block tiling
 #define br 32
 #define bc 32
-#define d_offset 65
+#define d_offset 65  // as in your code
+
+// Host helpers
+void input(char *input_filename);
+void output(char *output_filename);
 
 void input(char *input_filename) {
     FILE *file = fopen(input_filename, "rb");
-
     fread(&B, sizeof(int), 1, file);
     fread(&N, sizeof(int), 1, file);
     fread(&d, sizeof(int), 1, file);
@@ -35,142 +38,184 @@ void input(char *input_filename) {
         fread(V + (i * N * d), sizeof(float), N * d, file);
     }
     memset(O, 0x00, B * N * d * sizeof(float));
-
-    fclose(file);
 }
 
-void output(char *output_filename) {
-    FILE *file = fopen(output_filename, "wb");
+/**
+ * @brief Single kernel that processes all B batches.
+ *
+ * Each block (blockIdx.x, blockIdx.y) corresponds to:
+ *  - blockIdx.y = b in [0..B-1] (batch index)
+ *  - blockIdx.x = tile of rows in [0..(N/br)-1].
+ *
+ * Each thread block is (br=32, bc=32).
+ *  - threadIdx.y in [0..31] => sub-row within the tile
+ *  - threadIdx.x in [0..31] => sub-col
+ *
+ * We keep the "for (int j=0; j<tc; j++)" inside the kernel
+ * for chunking over columns in K & V (i.e. N is split in bc=32 column chunks).
+ */
+__global__ void flash_attention(
+    float *q, float *k, float *v, float *o, float *l,
+    int d, int N, int B
+) {
+    // figure out which row we are processing
+    int b   = blockIdx.y;                // which batch
+    int row = blockIdx.x * br + threadIdx.y;
 
-    fwrite(O, sizeof(float), B * N * d, file);
+    // how many column tiles?
+    int tc = N / bc; // assume N is multiple of 32
 
-    free(Q);
-    free(K);
-    free(V);
-    free(O);
+    // Pointers offset for the current batch
+    // Q, K, V, O are shaped [B, N, d], so:
+    float *Qb = q + (size_t)b * N * d;
+    float *Kb = k + (size_t)b * N * d;
+    float *Vb = v + (size_t)b * N * d;
+    float *Ob = o + (size_t)b * N * d;
+    float *Lb = l + (size_t)b * N;
 
-    fclose(file);
-}
+    // Shared memory allocations
+    __shared__ float kj[bc * d_offset];
+    __shared__ float vj[bc * d_offset];
+    __shared__ float sij[br * bc];   // S = QK^T * scalar
+    __shared__ float pij[br * bc];   // P = softmax(S)
+    __shared__ float qi[br * d_offset];
+    __shared__ float oi[br * d_offset];
+    __shared__ float li[br];
+    __shared__ float mij[br];  // row max
+    __shared__ float lij[br];  // row sum
 
-__global__ void flash_attention(float *q, float *k, float *v, float *o, float* l, float* m, int d, int tc, int N){
-    for (int j = 0; j < tc; j++){
-        // Load k and v to shared memory
-        __shared__ float kj[bc*d_offset];
-        __shared__ float vj[bc*d_offset];
-        int round = d / bc;
-        for(int i=0;i<round;i++){
-            kj[threadIdx.y*d_offset+threadIdx.x+i*bc] = k[j*bc*d+threadIdx.y*d+threadIdx.x+i*bc];
-            vj[threadIdx.y*d_offset+threadIdx.x+i*bc] = v[j*bc*d+threadIdx.y*d+threadIdx.x+i*bc];
-        }
+    // 1) Load Q and O for this row from global memory
+    //    We chunk the dimension d in steps of bc=32
+    int chunkCount = d / bc; // assume d multiple of 32
+    #pragma unroll 32
+    for (int r = 0; r < chunkCount; r++) {
+        // Q[row, r*bc + threadIdx.x]
+        qi[threadIdx.y * d_offset + threadIdx.x + r * bc] =
+            Qb[row * d + (r * bc + threadIdx.x)];
 
-        // Shared memory allocations
-        __shared__ float sij[br*bc];   // S = QK^T * scalar
-        __shared__ float pij[br*bc];   // P = softmax(S)
-        __shared__ float qi[br*d_offset];
-        __shared__ float oi[br*d_offset];
-        __shared__ float li[br];
-        __shared__ float mi[br];
-        __shared__ float mij[br];
-        __shared__ float lij[br];
+        // O[row, r*bc + threadIdx.x]  (initial partial)
+        oi[threadIdx.y * d_offset + threadIdx.x + r * bc] =
+            Ob[row * d + (r * bc + threadIdx.x)];
+    }
+    // Load partial l
+    if (threadIdx.x == 0) {
+        li[threadIdx.y] = Lb[row];
+    }
+    __syncthreads();
 
-        // Load Q and O from global memory
-        for(int round=0; round<d/bc; round++){
-            qi[threadIdx.y*d_offset+threadIdx.x+round*bc] = q[blockIdx.x*br*d+threadIdx.y*d+threadIdx.x+round*bc];
-            oi[threadIdx.y*d_offset+threadIdx.x+round*bc] = o[blockIdx.x*br*d+threadIdx.y*d+threadIdx.x+round*bc];
-        }
-
-        if(threadIdx.x == 0){
-            li[threadIdx.y] = l[blockIdx.x*br+threadIdx.y];
-            mi[threadIdx.y] = m[blockIdx.x*br+threadIdx.y];
+    // 2) For each column tile j in [0..tc-1]
+    #pragma unroll 32
+    for (int j = 0; j < tc; j++) {
+        // 2.a) Load K and V for these bc columns into shared memory
+        // The row in shared memory is threadIdx.y, the col is threadIdx.x,
+        // but here we actually store in [threadIdx.y*d_offset + threadIdx.x].
+        #pragma unroll 32
+        for (int i = 0; i < chunkCount; i++) {
+            // Kb[ (j*bc + threadIdx.y)*d + (i*bc + threadIdx.x) ]
+            kj[threadIdx.y * d_offset + threadIdx.x + i * bc] =
+                Kb[(size_t)(j * bc + threadIdx.y) * d + (i * bc + threadIdx.x)];
+            vj[threadIdx.y * d_offset + threadIdx.x + i * bc] =
+                Vb[(size_t)(j * bc + threadIdx.y) * d + (i * bc + threadIdx.x)];
         }
         __syncthreads();
 
-        // Inline QKDotAndScalar
+        // 2.b) QK^T dot product for (row, j*bc..(j+1)*bc)
         {
-            int row = threadIdx.y;
             int col = threadIdx.x;
             float val = 0.0f;
+            // compute dot for dimension d
+            #pragma unroll 32
             for (int t = 0; t < d; t++) {
-                val += qi[row * d_offset + t] * kj[col * d_offset + t];
+                val += qi[threadIdx.y * d_offset + t]
+                      * kj[col * d_offset + t];
             }
-            sij[row * bc + col] = val * (1.0f / sqrtf((float)d));
+            // scale by 1 / sqrt(d)
+            sij[threadIdx.y * bc + col] = val * (1.0f / sqrtf((float)d));
         }
         __syncthreads();
 
-        // Inline RowMax
+        // 2.c) RowMax (sequential or warp-based).
+        // Here, do a simple sequential approach for clarity.
         {
-            int row = threadIdx.y;
             if (threadIdx.x == 0) {
-                float max_val = sij[row * bc];
-                for (int i = 0; i < bc; i++) {
-                    max_val = _max(max_val, sij[row * bc + i]);
+                float max_val = sij[threadIdx.y * bc];
+                for (int i = 1; i < bc; i++) {
+                    float tmp = sij[threadIdx.y * bc + i];
+                    if (tmp > max_val) max_val = tmp;
                 }
-                mij[row] = max_val;
+                mij[threadIdx.y] = max_val;
             }
         }
         __syncthreads();
 
-        // Inline MinusMaxAndExp
+        // 2.d) Subtract max and exponentiate
         {
-            int row = threadIdx.y;
             int col = threadIdx.x;
-            pij[row * bc + col] = expf(sij[row * bc + col] - mij[row]);
+            float m = mij[threadIdx.y];
+            float val = sij[threadIdx.y * bc + col] - m;
+            pij[threadIdx.y * bc + col] = __expf(val);
         }
         __syncthreads();
 
-        // Inline RowSum
+        // 2.e) RowSum
         {
-            int row = threadIdx.y;
             if (threadIdx.x == 0) {
                 float sum_val = 0.0f;
+                #pragma unroll 32
                 for (int i = 0; i < bc; i++) {
-                    sum_val += pij[row * bc + i];
+                    sum_val += pij[threadIdx.y * bc + i];
                 }
-                lij[row] = sum_val;
+                lij[threadIdx.y] = sum_val;
             }
         }
         __syncthreads();
 
-        // Inline UpdateMiLiOi
+        // 2.f) Update partial O and partial l
         {
             __shared__ float li_new[br];
             int i = threadIdx.y;
-            int jx = threadIdx.x;
+            int col = threadIdx.x;
 
-            // Compute mi_new, li_new
-            if(jx == 0){ 
-                li_new[i] = expf(mi[i] - 0) * li[i] + expf(mij[i] - 0) * lij[i];
+            if (col == 0) {
+                // li_new = li + e^m_ij * row_sum
+                li_new[i] = li[i] + __expf(mij[i]) * lij[i];
             }
-            // __syncthreads();
+            __syncthreads();
 
-            // Update Oi
-            for(int r =0; r < d/bc; r++){
+            // Update O
+            #pragma unroll 32
+            for (int r = 0; r < chunkCount; r++) {
                 float pv = 0.0F;
+                // sum over these bc columns
+                #pragma unroll 32
                 for (int t = 0; t < bc; t++) {
-                    pv += pij[i * bc + t] * vj[t * d_offset + jx+r*bc];
+                    pv += pij[i * bc + t] *
+                          vj[t * d_offset + (col + r * bc)];
                 }
-                // Weighted combination for oi
-                oi[i * d_offset + jx+r*bc] = (li[i] * expf(mi[i] - 0) * oi[i * d_offset + jx+r*bc] 
-                                             + expf(mij[i] - 0) * pv) / li_new[i];
+                // Weighted combination
+                // O_i = ( li[i]*old_Oi + e^mij[i]*pv ) / li_new[i]
+                float oldVal = oi[i * d_offset + (col + r * bc)];
+                float numerator = li[i] * oldVal + __expf(mij[i]) * pv;
+                oi[i * d_offset + (col + r * bc)] = numerator / li_new[i];
             }
-            // __syncthreads();
+            __syncthreads();
 
-            // Update mi, li
-            if(jx == 0){
-                mi[i] = 0;
+            // update li
+            if (col == 0) {
                 li[i] = li_new[i];
             }
         }
-        // __syncthreads();
+        __syncthreads();
+    } // end for (j in [0..tc-1])
 
-        // Write back O, l, m
-        for(int round=0; round<d/bc; round++){
-            o[blockIdx.x*br*d+threadIdx.y*d+threadIdx.x+round*bc] = oi[threadIdx.y*d_offset+threadIdx.x+round*bc];
-        }
-        if(threadIdx.x == 0){
-            l[blockIdx.x*br+threadIdx.y] = li[threadIdx.y];
-            m[blockIdx.x*br+threadIdx.y] = mi[threadIdx.y];
-        }
+    // 3) Write final O and l back to global memory
+    #pragma unroll 32
+    for (int r = 0; r < chunkCount; r++) {
+        Ob[row * d + (r * bc + threadIdx.x)] =
+            oi[threadIdx.y * d_offset + (r * bc + threadIdx.x)];
+    }
+    if (threadIdx.x == 0) {
+        Lb[row] = li[threadIdx.y];
     }
 }
 
@@ -180,53 +225,45 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Read input
     input(argv[1]);
 
-    float *device_Q;
-    float *device_K;
-    float *device_V;
-    float *device_O;
-    float *device_l;
-    float *device_m;
-
-    //copy data to device
-    cudaHostRegister(Q, sizeof(float)*N*B*d, cudaHostRegisterDefault);
-    cudaHostRegister(K, sizeof(float)*N*B*d, cudaHostRegisterDefault);
-    cudaHostRegister(V, sizeof(float)*N*B*d, cudaHostRegisterDefault);
+    // Allocate device memory
+    float *device_Q, *device_K, *device_V, *device_O, *device_l;
     cudaMalloc(&device_Q, sizeof(float)*N*B*d);
     cudaMalloc(&device_K, sizeof(float)*N*B*d);
     cudaMalloc(&device_V, sizeof(float)*N*B*d);
     cudaMalloc(&device_O, sizeof(float)*N*B*d);
     cudaMalloc(&device_l, sizeof(float)*N*B);
-    cudaMalloc(&device_m, sizeof(float)*N*B);
-    cudaMemcpy(device_Q, Q, sizeof(float)*N*B*d, cudaMemcpyHostToDevice);
-    cudaMemcpy(device_K, K, sizeof(float)*N*B*d, cudaMemcpyHostToDevice);
-    cudaMemcpy(device_V, V, sizeof(float)*N*B*d, cudaMemcpyHostToDevice);
 
+    // Optional: pinned host registration, asynchronous copies
+    cudaHostRegister(Q, sizeof(float)*N*B*d, cudaHostRegisterDefault);
+    cudaHostRegister(K, sizeof(float)*N*B*d, cudaHostRegisterDefault);
+    cudaHostRegister(V, sizeof(float)*N*B*d, cudaHostRegisterDefault);
+
+    // Copy inputs to device
+    cudaMemcpyAsync(device_Q, Q, sizeof(float)*N*B*d, cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(device_K, K, sizeof(float)*N*B*d, cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(device_V, V, sizeof(float)*N*B*d, cudaMemcpyHostToDevice);
     cudaMemset(device_O, 0, sizeof(float)*N*B*d);
     cudaMemset(device_l, 0, sizeof(float)*N*B);
-    cudaMemset(device_m, FLT_MIN, sizeof(float)*N*B);
 
-    int tr = N / br, tc = N / bc;
-    dim3 blockPerGrid(tr);
-    dim3 threadPerBlock(br, bc);
+    // Launch the kernel ONCE
+    int tr = N / br;  // how many row-tiles
+    dim3 blockPerGrid(tr, B);
+    dim3 threadPerBlock(br, bc); // (32, 32)
 
-    for (int i = 0; i < B; i++) {
-        flash_attention<<<blockPerGrid, threadPerBlock>>>(
-            device_Q + (i * N * d), 
-            device_K + (i * N * d), 
-            device_V + (i * N * d), 
-            device_O + (i * N * d),
-            device_l + (i * N),
-            device_m + (i * N),
-            d, tc, N
-        );
-    }
+    flash_attention<<<blockPerGrid, threadPerBlock>>>(
+        device_Q, device_K, device_V, device_O, device_l,
+        d, N, B
+    );
 
-    //copy data back to host
-    cudaMemcpy(O, device_O, sizeof(float)*N*B*d, cudaMemcpyDeviceToHost);
-    
-    output(argv[2]);
+    // Copy result back
+    cudaMemcpyAsync(O, device_O, sizeof(float)*N*B*d, cudaMemcpyDeviceToHost);
+
+    // Output
+    FILE *file = fopen(argv[2], "wb");
+    fwrite(O, sizeof(float), B * N * d, file);
 
     return 0;
 }
