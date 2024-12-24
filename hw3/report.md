@@ -1,23 +1,18 @@
----
-title: PP2024 HW3
-
----
-
 # PP2024 HW3
 113062574 葛奕宣
 
 ## Implementation 
 1. Which algorithm do you choose in hw3-1?
-Basic Floyd-warshall
+Basic Floyd-warshall, which contains three for loop that iterate through every matrix in k rounds. I parallel the second for loop calculation using openmp.
 3. How do you divide your data in hw3-2, hw3-3?
 Since my block_size is 78 and threads per block is (26,26). So one thread is responsible for 9 data, each data in distance of 1/3*block_size.
-Eg. Thread(0,0) is responsible for: (0,0), (0,1/3*blocksize), (0, 2*1/3*blocksize), (1/3*blocksize, 0), (1/3*blocksize, 1/3*blocksize), (1/3*blocksize, 2*1/3*blocksize)…… total 9 data.
-In 3-3, I let each GPU do half of the block in phase 3, upper half and lower half
+Eg. Thread(0,0) is responsible for: (0,0), (0,1/3*blocksize), (0, 2*1/3*blocksize), (1/3*blocksize, 0), (1/3*blocksize, 1/3*blocksize), (1/3*blocksize, 2*1/3*blocksize)…… total 9 data. The distance is for simplicity in coding and the reason why not using full thread per block(32x32) is because 32 cannot divide 78, which may cause additional warp divergence. So I choose the biggest number that can divide 78 -- 26.
+In 3-3, I let each GPU do half of the block in phase 3, upper half and lower half. The data is still fully copied in each gpu. But calculation is parallelized with additional communication for exchanging half data.
 5. What’s your configuration in hw3-2, hw3-3? And why? (e.g. blocking factor, #blocks, #threads)
 I choose B(block_size) as 78, threads per block as (26*26). #block is V after padding divided by block_size. The reason for 78 is to utilize the space of share memory.
-Total shared memory is 49152, we need 2 matrix in phase 2, 3. So, it is sqrt(49152/4/2). Max block_size is 78. And the thread size limit is 1024. So I choose 26, 1/3 of 78. I’ve tested (78,15) thread size, where each thread is responsible for only 6 data. But the result is worse
+Total shared memory is 49152, we need only 2 matrix in phase 2, 3. So, it is sqrt(49152/4/2). Max block_size is 78. And the thread size limit is 1024. So I choose 26, 1/3 of 78. I’ve tested (78,15) thread size, where each thread is responsible for only 6 data. But the result is worse
 7. How do you implement the communication in hw3-3?
-Because each gpu do half of the blocks in phase 3. I need to copy the calculated result after half of the total round is finished. Otherwise, the calculation in phase 1 will be wrong since the data isn’t the newest. So, I copy the data back to host and copy the data back to device. The ideal method is to copy from device to device. But I got a worse result
+Because each gpu do half of the blocks in phase 3. I need to copy the calculated result after half of the total round is finished. Otherwise, the calculation in phase 1 will be wrong since the data isn’t the newest. So, I copy the data back to host and copy the data back to device. The ideal method is to copy from device to device. But I got a worse result.
 9. Briefly describe your implementations in diagrams, figures or sentences.
 * 3-1: OpenMP Parallelization
     - **Approach**: The normal Floyd-Warshall algorithm is implemented.
