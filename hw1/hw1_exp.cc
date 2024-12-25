@@ -2,6 +2,7 @@
 #include <boost/sort/spreadsort/float_sort.hpp>
 #include <algorithm>
 #include <string>
+#include <nvtx3/nvToolsExt.h>
 
 void merge_array_left(float* &my, float* received, float* &ans, int my_size, int other_size){
     int l1, r1 ,ans_num;
@@ -35,6 +36,10 @@ void merge_array_right(float* &my, float* received, float* &ans, int my_size, in
 }
 
 int main(int argc, char **argv) {
+
+    nvtxRangePush("main");
+
+
     MPI_Init(&argc, &argv);
 
     // double IO_time=0.0, Com_time=0.0, start_time=0.0;
@@ -81,14 +86,19 @@ int main(int argc, char **argv) {
     rest_size = array_size%world_size;
     if(rank<rest_size) rank_size++;
 
-    // Using ternary operators
-    left_neighbor = (rank == 0) ? -1 : (rank - 1);
+    if(rank==0) left_neighbor = -1;
+    else left_neighbor = rank-1;
+    // 2nd case handle when P>N
+    if(rank==world_size-1 || (rank==rest_size-1&&rank_size==1)) right_neighbor = -1;
+    else right_neighbor = rank+1;
 
-    right_neighbor = (rank == world_size - 1 || (rank == rest_size - 1 && rank_size == 1)) ? -1 : (rank + 1);
-
-    // Start calculation using ternary operator
-    start = (rank < rest_size) ? (rank_size * rank) : ((rank_size + 1) * rest_size + (rank - rest_size) * rank_size);
-
+    //start
+    if(rank<rest_size){
+        start = rank_size*rank;
+    }
+    else {
+        start = (rank_size+1)*rest_size + (rank-rest_size)*rank_size;
+    }
 
     //left_count, right_count
     if(rank==rest_size-1){
@@ -110,29 +120,78 @@ int main(int argc, char **argv) {
     float *received_array = new float[rank_size+1];
     float *result_array = new float[rank_size];
     
+    nvtxRangePush("IO");
     MPI_File_open(new_comm, input_filename, MPI_MODE_RDONLY, MPI_INFO_NULL, &input_file);
     if(rank_size!=0) {
         MPI_File_read_at(input_file, sizeof(float) *start, my_array, rank_size, MPI_FLOAT, MPI_STATUS_IGNORE);
     }
-    MPI_File_open(new_comm, output_filename, MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL, &output_file);
+    nvtxRangePop();
     // MPI_File_close(&input_file);
     //sort local
     if(rank_size!=0){
         boost::sort::spreadsort::float_sort(my_array, my_array+rank_size);
     }
-    int t = num_used_procs;
+    // int t = 2;
     float received_num;
-    while(t--){
+    // if(world_size>=5){
+    //     while(t--){
+    //         //odd round
+    //         if(rank&1){
+    //             if(right_neighbor!=-1){
+    //                 // start_time = MPI_Wtime();
+    //                 MPI_Sendrecv(my_array+rank_size-1, 1, MPI_FLOAT, right_neighbor, 0, &received_num, 1, MPI_FLOAT, right_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
+    //                 // Com_time+= MPI_Wtime() - start_time;
+    //                 if(received_num<my_array[rank_size-1]){
+    //                     // start_time = MPI_Wtime();
+    //                     MPI_Sendrecv(my_array, rank_size, MPI_FLOAT, right_neighbor, 0, received_array, right_count, MPI_FLOAT, right_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
+    //                     // Com_time+= MPI_Wtime() - start_time;
+    //                     merge_array_right(my_array, received_array, result_array, rank_size, right_count);
+    //                 }
+    //             }
+    //         }
+    //         else {
+    //             if(left_neighbor!=-1){
+    //                 MPI_Sendrecv(my_array, 1, MPI_FLOAT, left_neighbor, 0, &received_num, 1, MPI_FLOAT, left_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
+    //                 if(received_num>my_array[0]){
+    //                     MPI_Sendrecv(my_array, rank_size, MPI_FLOAT, left_neighbor, 0, received_array, left_count, MPI_FLOAT, left_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
+    //                     merge_array_left(my_array, received_array, result_array, rank_size, left_count);
+    //                 }
+    //             }
+    //         }
+    //         //even round
+    //         if(rank&1){
+    //             if(left_neighbor!=-1){
+    //                 MPI_Sendrecv(my_array, 1, MPI_FLOAT, left_neighbor, 0, &received_num, 1, MPI_FLOAT, left_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
+    //                 if(received_num>my_array[0]){
+    //                     MPI_Sendrecv(my_array, rank_size, MPI_FLOAT, left_neighbor, 0, received_array, left_count, MPI_FLOAT, left_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
+    //                     merge_array_left(my_array, received_array, result_array, rank_size, left_count);
+    //                 }
+    //             }
+    //         }
+    //         else {
+    //             if(right_neighbor!=-1){
+    //                 MPI_Sendrecv(my_array+rank_size-1, 1, MPI_FLOAT, right_neighbor, 0, &received_num, 1, MPI_FLOAT, right_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
+    //                 if(received_num<my_array[rank_size-1]){
+    //                     MPI_Sendrecv(my_array, rank_size, MPI_FLOAT, right_neighbor, 0, received_array, right_count, MPI_FLOAT, right_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
+    //                     merge_array_right(my_array, received_array, result_array, rank_size, right_count);
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
+    
+    int all_sort=0;
+    int sort = 0;
+    while(all_sort < world_size){
+        nvtxRangePush("Loop");
+        sort = 1;
         //odd round
         if(rank&1){
             if(right_neighbor!=-1){
-                // start_time = MPI_Wtime();
                 MPI_Sendrecv(my_array+rank_size-1, 1, MPI_FLOAT, right_neighbor, 0, &received_num, 1, MPI_FLOAT, right_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
-                // Com_time+= MPI_Wtime() - start_time;
                 if(received_num<my_array[rank_size-1]){
-                    // start_time = MPI_Wtime();
+                    sort = 0;
                     MPI_Sendrecv(my_array, rank_size, MPI_FLOAT, right_neighbor, 0, received_array, right_count, MPI_FLOAT, right_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
-                    // Com_time+= MPI_Wtime() - start_time;
                     merge_array_right(my_array, received_array, result_array, rank_size, right_count);
                 }
             }
@@ -141,6 +200,7 @@ int main(int argc, char **argv) {
             if(left_neighbor!=-1){
                 MPI_Sendrecv(my_array, 1, MPI_FLOAT, left_neighbor, 0, &received_num, 1, MPI_FLOAT, left_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
                 if(received_num>my_array[0]){
+                    sort = 0;
                     MPI_Sendrecv(my_array, rank_size, MPI_FLOAT, left_neighbor, 0, received_array, left_count, MPI_FLOAT, left_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
                     merge_array_left(my_array, received_array, result_array, rank_size, left_count);
                 }
@@ -151,6 +211,7 @@ int main(int argc, char **argv) {
             if(left_neighbor!=-1){
                 MPI_Sendrecv(my_array, 1, MPI_FLOAT, left_neighbor, 0, &received_num, 1, MPI_FLOAT, left_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
                 if(received_num>my_array[0]){
+                    sort = 0;
                     MPI_Sendrecv(my_array, rank_size, MPI_FLOAT, left_neighbor, 0, received_array, left_count, MPI_FLOAT, left_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
                     merge_array_left(my_array, received_array, result_array, rank_size, left_count);
                 }
@@ -160,21 +221,29 @@ int main(int argc, char **argv) {
             if(right_neighbor!=-1){
                 MPI_Sendrecv(my_array+rank_size-1, 1, MPI_FLOAT, right_neighbor, 0, &received_num, 1, MPI_FLOAT, right_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
                 if(received_num<my_array[rank_size-1]){
+                    sort = 0;
                     MPI_Sendrecv(my_array, rank_size, MPI_FLOAT, right_neighbor, 0, received_array, right_count, MPI_FLOAT, right_neighbor, 0, new_comm, MPI_STATUS_IGNORE);
                     merge_array_right(my_array, received_array, result_array, rank_size, right_count);
                 }
             }
         }
+        nvtxRangePop();
+        MPI_Allreduce(&sort, &all_sort, 1, MPI_INT, MPI_SUM, new_comm);
     }
-
-    MPI_File_write_at(output_file, sizeof(float) * start, my_array, rank_size, MPI_FLOAT, MPI_STATUS_IGNORE);
-
+    
+    nvtxRangePush("IO");
+    MPI_File_open(new_comm, output_filename, MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL, &output_file);
+    if (rank_size != 0) {
+        MPI_File_write_at(output_file, sizeof(float) * start, my_array, rank_size, MPI_FLOAT, MPI_STATUS_IGNORE);
+    }
+    nvtxRangePop();
     // MPI_File_close(&output_file);
     // delete []my_array;
     // delete []received_array;
     // delete []result_array;
 
     // MPI_Finalize();
+    nvtxRangePop();
     return 0;
 }
 
